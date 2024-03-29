@@ -1,0 +1,471 @@
+---
+title: "Hoboware Emulator"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+```{r}
+# Import dependencies
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+```
+
+```{r}
+# Drag and drop the files to the data folder
+# Then update the file name in the field below
+CONDUCTIVITY_FILENAME <- 'SR4_ConDL_6_22_2023_lkg.csv'
+```
+
+```{r}
+create_relative_path_from_filename <- function(filename) {
+  data_folder <- './data'
+  file.path(data_folder, filename)
+}
+
+# Example usage
+file_path <- create_relative_path_from_filename(CONDUCTIVITY_FILENAME)
+cat("Relative path to the file:", file_path, "\n")
+```
+
+```{r}
+read_data <- function(file_path) {
+  tryCatch(
+    {
+      # Attempt to read as UTF-8 encoded CSV
+      con_data <- read_csv(file_path, locale = locale(encoding = "UTF-8"), col_types = cols())
+      names(con_data) <- iconv(names(con_data), from = "latin1", to = "UTF-8")
+
+
+    },
+    error = function(e) {
+      # If UTF-8 fails, try reading with ISO-8859-1 encoding
+      con_data <- read_csv(file_path, locale = locale(encoding = "ISO-8859-1"), col_types = cols())
+      names(con_data) <- iconv(names(con_data), from = "ISO-8859-1", to = "UTF-8")
+
+    }
+  )
+  
+  con_data
+}
+
+con_data <- read_data(file_path)
+head(con_data, 5)
+```
+
+```{r}
+# Remove the first row if it is a title row
+if (any(grepl("Plot Title", con_data[1, ]))) {
+  con_data <- con_data[-1, ]
+}
+
+# Create a list of columns to drop
+columns_to_drop <- grep("Coupler", names(con_data), value = TRUE)
+
+# Drop the columns from the dataframe
+con_data <- con_data[, !(names(con_data) %in% columns_to_drop)]
+# Display the first 10 rows of the data
+head(con_data, 10)
+```
+
+```{r}
+# Assuming con_data is your DataFrame
+# Example DataFrame
+# con_data <- data.frame(
+#   "Date Time, GMT-04:00" = c("6/15/2023 12:40", "6/15/2023 12:50"),
+#   "High Range, ?S/cm (LGR S/N: 20649629, SEN S/N: 20649629)" = c(30912.5, 30871.9),
+#   "Temp, °C (LGR S/N: 20649629)" = c(22.31, 22.44)
+# )
+
+# Step 1: Extract S/N from the column name
+# This regex looks for the pattern "S/N: " followed by digits in the column name and captures the digits
+sn_pattern <- "S/N:\\s*(\\d+)"
+high_range_sn <- grep("High Range", names(con_data), value = TRUE)
+temp_sn <- grep("Temp", names(con_data), value = TRUE)
+
+# Assuming the S/N is the same across these columns, extract from one of them
+serial_number <- ifelse(length(high_range_sn) > 0, 
+                         sub(".*S/N:\\s*(\\d+).*", "\\1", high_range_sn[1]),
+                         ifelse(length(temp_sn) > 0, 
+                                sub(".*S/N:\\s*(\\d+).*", "\\1", temp_sn[1]),
+                                "Unknown"))
+
+# Step 2: Assign the extracted S/N to a new column for each row
+con_data$`S/N` <- as.integer(serial_number)
+
+# Step 3: Clean the column names by removing the S/N part and renaming them
+names(con_data)[names(con_data) %in% high_range_sn] <- "High Range"
+names(con_data)[names(con_data) %in% temp_sn] <- "Temp"
+names(con_data)[names(con_data) == "Date Time, GMT-04:00"] <- "Date Time"
+
+# Display the updated DataFrame
+head(con_data, 10)
+```
+
+```{r}
+# Display the last 10 rows of the data
+tail(con_data, 10)
+```
+
+```{r}
+# Define Salinity, Specific Conductance, Temperature Coefficients
+# These are R implementations of the formulas in the Hoboware Data Sheet and software. They produce near identical results and are easily modifiable here.
+
+HOBOWARE_OFFSET <- 5.0 # Experimental offset to match the value in the file
+
+# Define the coefficients
+a_coeffs <- c(0.008, -0.1692, 25.3851, 14.0941, -7.0261, 2.7081)
+b_coeffs <- c(0.0005, -0.0056, -0.0066, -0.0375, 0.0636, -0.0144)
+c_coeffs <- c(6.766097e-01, 2.00564e-02, 1.104259e-04, -6.9698e-07, 1.0031e-09)
+k <- 0.0162
+R_factor <- 42.914
+
+pss78_A <- 1.86221444
+pss78_B <- 7.9914178e-03
+pss78_C <- -2.0488276e-03
+pss78_D <- -4.79386353e-05
+pss78_E <- 1.67997158e-05
+pss78_F <- -1.55721008e-05
+
+# Calculate the salinity
+calculate_salinity <- function(Ye, T = 25) {
+  Ye_mS <- Ye / 1000.0  # Convert to milliSiemens
+  Ye_mS <- max(Ye_mS, 0.0)  # Ensure non-negative
+  
+  T_factor <- (T - 15.0) / (1.0 + k * (T - 15.0))
+  T_powers <- T^(0:4)
+  rT <- sum(c_coeffs * T_powers)
+  R <- Ye_mS / R_factor
+  Rt <- R / rT
+  
+  Rt_powers <- Rt^((1:5) / 2)
+  
+  b_result <- sum(b_coeffs * Rt_powers)
+  a_result <- sum(a_coeffs * Rt_powers)
+  
+  (a_result + T_factor * b_result) + HOBOWARE_OFFSET # HOBOWARE_OFFSET is a hack: Add 5 ppt to match the value in the file
+  # (a_result + T_factor * b_result)
+}
+
+calculate_temp_coefficient <- function(S, T) {
+  pss78_A + (pss78_B * T) + (pss78_C * S) +
+    (pss78_D * T^2) + (pss78_E * S^2) +
+    (pss78_F * T * S)
+}
+
+calculate_specific_conductance <- function(Ye, T, a) {
+  Ye / (1 - ((25 - T) * a / 100))
+}
+```
+
+```{r}
+# Calculate uncalibrated Salinity and Specific Conductance from HighRange (Ye)
+
+# Apply the formulas to the entire DataFrame
+con_data$`Salinity (ppt)` <- mapply(calculate_salinity, con_data$`High Range`, con_data$Temp)
+con_data$`Specific Conductance (μS/cm)` <- mapply(calculate_specific_conductance, con_data$`High Range`, con_data$Temp,
+                                                  mapply(calculate_temp_coefficient, con_data$`Salinity (ppt)`, con_data$Temp))
+
+head(con_data, 5)
+```
+
+```{r}
+# Two-point calibration of Specific Conductance
+
+# <Reference to the formula goes here>
+
+### Input average YSI values from the deployment
+
+CM1 <- 43232  # Conductivity at the beginning of deployment
+TM1 <- 21.3  # Temperature at the beginning of deployment
+CM2 <- 41010  # Conductivity at the end of deployment
+TM2 <- 19.8  # Temperature at the end of deployment
+```
+
+```{r}
+# Calculate MS1 and MS2
+MS1 <- calculate_specific_conductance(CM1, TM1, calculate_temp_coefficient(calculate_salinity(CM1, TM1), TM1))
+MS2 <- calculate_specific_conductance(CM2, TM2, calculate_temp_coefficient(calculate_salinity(CM2, TM2), TM2))
+
+# Calculate R1 and R2
+R1 <- 1 / con_data$`Specific Conductance (μS/cm)`[1] - 1 / MS1
+R2 <- 1 / con_data$`Specific Conductance (μS/cm)`[nrow(con_data)] / MS2
+
+# Ensure R1 and R2 are not too small
+R1 <- max(R1, 1e-11)
+R2 <- max(R2, 1e-11)
+
+# Calculate A and B
+t1 <- 0  # Assuming the first timestamp is at 0
+t2 <- nrow(con_data) - 1  # Assuming the last timestamp is the length of the data - 1
+A <- (R2 - R1) / (t2 - t1)
+B <- R1 - (A * t1)
+
+# Calculate E(t) and Cscal(t)
+E <- dplyr::case_when(
+  1:nrow(con_data) < t1 ~ 1 / R1,
+  1:nrow(con_data) > t2 ~ 1 / R2,
+  TRUE ~ 1 / (A * (1:nrow(con_data)) + B)
+)
+
+con_data$Cscal <- E * con_data$`Specific Conductance (μS/cm)` / (E - con_data$`Specific Conductance (μS/cm)`)
+head(con_data, 5)
+```
+
+```{r}
+# Use Cscal to calculate Adjusted Salinity
+
+HOBOWARE_SALINITY_OFFSET <- 2
+```
+
+```{r}
+con_data$`Adjusted Salinity (ppt)` <- mapply(function(x) calculate_salinity(x, 25) - HOBOWARE_SALINITY_OFFSET, con_data$Cscal)
+head(con_data, 5)
+```
+
+```{r}
+# Calculate Adjusted DO
+DODL_FILENAME <- 'SR4_DODL_6_22_2023_lkg.csv'
+```
+
+```{r}
+file_path <- create_relative_path_from_filename(DODL_FILENAME)
+cat("Relative path to the file:", file_path, "\n")
+```
+
+```{r}
+do_data <- read_data(file_path)
+head(do_data, 5)
+```
+
+
+```{r}
+# Remove the first row if it is a title row
+if (any(grepl("Plot Title", do_data[1, ]))) {
+  do_data <- do_data[-1, ]
+}
+
+# Create a list of columns to drop
+columns_to_drop <- grep("Coupler", names(do_data), value = TRUE)
+
+# Drop the columns from the dataframe
+do_data <- do_data[, !(names(do_data) %in% columns_to_drop)]
+# Display the first 10 rows of the data
+head(do_data, 10)
+```
+
+
+```{r}
+# Assuming do_data is your DataFrame
+
+# Example DataFrame
+# do_data <- data.frame(
+#   "Date Time, GMT-04:00" = c("6/15/2023 12:40", "6/15/2023 12:50"),
+#   "DO conc, mg/L (LGR S/N: 20659181)" = c(9.27, 9.37),
+#   "Temp, �C (LGR S/N: 20659181)" = c(21.56, 21.84)
+# )
+
+# Step 1: Extract S/N from the column name
+# This regex looks for the pattern "S/N: " followed by digits in the column name and captures the digits
+sn_pattern <- "S/N:\\s*(\\d+)"
+do_conc_sn <- grep("DO conc", names(do_data), value = TRUE)
+temp_sn <- grep("Temp", names(do_data), value = TRUE)
+
+# Assuming the S/N is the same across these columns, extract from one of them
+sn_match <- regexpr(sn_pattern, ifelse(length(do_conc_sn) > 0, do_conc_sn[1], temp_sn[1]))
+serial_number <- ifelse(sn_match != -1, regmatches(ifelse(length(do_conc_sn) > 0, do_conc_sn[1], temp_sn[1]), sn_match)[[1]], "Unknown")
+
+# Step 2: Assign the extracted S/N to a new column for each row
+do_data$`S/N` <- as.integer(serial_number)
+
+# Step 3: Rename columns to a more generic format without modifying their values
+names(do_data)[names(do_data) %in% do_conc_sn] <- ifelse(length(do_conc_sn) > 0, "DO conc", names(do_data)[2])
+names(do_data)[names(do_data) %in% temp_sn] <- ifelse(length(temp_sn) > 0, "Temp_DO", names(do_data)[3])
+
+# Display the updated DataFrame
+head(do_data, 10)
+```
+
+
+```{r}
+# Filter data
+
+# Assuming do_data is your DataFrame with the DO concentration data
+
+# Define the start and end date for the data
+START_DATE <- '06/15/2023 12:40 AM'
+END_DATE <- '06/22/2023 10:40 PM'
+
+# Convert "Date Time, GMT-04:00" column to datetime
+do_data$`Date Time, GMT-04:00` <- mdy_hm(do_data$`Date Time, GMT-04:00`)
+
+# Correct the format string to match the date strings
+start_date <- mdy_hm(START_DATE)
+end_date <- mdy_hm(END_DATE)
+
+# Filter the data
+do_data <- do_data[do_data$`Date Time, GMT-04:00` >= start_date & do_data$`Date Time, GMT-04:00` <= end_date, ]
+
+head(do_data, 10)
+```
+
+
+```{r}
+tail(do_data, 10)
+```
+
+
+```{r}
+# Constants
+CALGAIN <- 1.05221  # Calibration Gain
+CALOFFSET <- 0.01009  # Calibration Offset
+
+DOMETER1 <- 7.6  # DO meter reading at the beginning of deployment
+DOMETER2 <- 7.89   # DO meter reading at the end of deployment
+```
+
+
+```{r}
+B0 <- -6.246090E-3
+B1 <- -7.423444E-3
+B2 <- -1.048635E-2
+B3 <- -7.987907E-3
+C0 <- -4.679983E-7
+
+# Adjust DO Concentration in fresh water using Calibration Gain and Offset
+do_data$DOFWCAL <- (do_data$`DO conc` * CALGAIN) + CALOFFSET
+
+# Calculate Salinity Correction Factor: SC (t)
+do_data$TS <- log((298.15 - do_data$Temp_DO) / (273.15 + do_data$Temp_DO))
+do_data$SC <- exp(con_data$`Adjusted Salinity (ppt)` * (B0 + (B1 * do_data$TS) + (B2 * do_data$TS^2) + (B3 * do_data$TS^3)) + C0 * con_data$`Adjusted Salinity (ppt)`^2)
+
+# Calculate DO Concentration adjusted for salinity / conductivity: DOSW (mg/L)8962
+do_data$DOSW <- do_data$DOFWCAL * do_data$SC
+
+# Calculate E1 and E2
+E1 <- (do_data$DOSW[1] - DOMETER1) / do_data$DOSW[1] * 100
+E2 <- (do_data$DOSW[nrow(do_data)] - DOMETER2) / do_data$DOSW[nrow(do_data)] * 100
+
+# Calculate A and B
+t1 <- 0  # Assuming the first timestamp is 0
+t2 <- nrow(do_data) - 1  # Assuming the last timestamp is the length of the data - 1
+A <- (E2 - E1) / (t2 - t1)
+B <- E1 - A * t1
+
+# Calculate E(t) and DOFIELDCAL(t)
+E <- dplyr::case_when(
+  1:nrow(do_data) < t1 ~ E1,
+  1:nrow(do_data) > t2 ~ E2,
+  TRUE ~ A * (1:nrow(do_data)) + B
+)
+
+do_data$DOFIELDCAL <- (1 - E / 100) * do_data$DOFWCAL
+
+# Recalculate DO Concentration adjusted for salinity / conductivity: DOSW (mg/L)
+do_data$DOSW <- do_data$DOFIELDCAL * do_data$SC
+```
+
+```{r}
+
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+

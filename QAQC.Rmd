@@ -1,0 +1,132 @@
+---
+title: "QAQC"
+author: "Tanmay Agrawal"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+
+# QA/QC Module
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(readxl)
+library(plotly)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Drag and drop the files to the data folder
+# Then update the file name in the field below
+BBC_filename <- 'BBC_Example_Data_QC_Module.xlsx'
+setwd("/Users/christina/hoboware_emulator")
+```
+
+```{r}
+create_relative_path_from_filename <- function(filename) {
+  data_folder <- './data'
+  file.path(data_folder, filename)
+}
+
+file_path <- create_relative_path_from_filename(BBC_filename)
+cat("Relative path to the file:", file_path, "\n")
+```
+
+```{r}
+bbc_data <- read_excel(file_path)
+head(bbc_data)
+```
+
+```{r}
+bbc_data <- bbc_data %>%
+  mutate(
+    Temp_QC = ifelse(Temp_C_DOlogger < 5 | Temp_C_DOlogger > 35, TRUE, FALSE),
+    HighRange_QC = ifelse(`High Range, μS/cm` < 1000 | `High Range, μS/cm` > 55000, TRUE, FALSE),
+    DO_QC = ifelse(DO_mgl > 20, TRUE, FALSE)
+  )
+
+head(bbc_data)
+```
+
+### Salinity ranges used
+
+```{r}
+salinity_ranges <- tribble(
+  ~Embayment, ~StnID, ~Latitude, ~Longitude, ~Max_QC_Sal, ~Min_QC_Sal,
+  "Quissett Harbor", "QH2", 41.543981, -70.652772, 34, 26,
+  "Herring Brook", "HB3A", 41.623896, -70.639078, 20, 2,
+  "Wild Harbor", "WH1X", 41.640888, -70.643709, 35, 22,
+  "Red Brook Harbor", "RB1", 41.674697, -70.615118, 35, 23,
+  "Wareham River", "WR6", 41.740175, -70.706363, 32, 19,
+  "Slocums River", "SR4", 41.538091, -70.977211, 35, 14,
+  "Apponagansett Bay", "AB2", 41.583514, -70.944682, 35, 25,
+  "Westport River", "E33A", 41.54363, -71.05974, 33, 14,
+  "Westport Rivers", "W12A", 41.530439, -71.100328, 34, 16,
+  "Lake Tashmoo", "TSH8", 41.45104, -70.62418, 34, 27,
+  "James Pond", "JMS3", 41.43929, -70.67175, 31, 18,
+  "M44 Menemsha", "M44", NA, NA, 34, 18,
+  "S33 Squibnocket", "S33", NA, NA, 34, 18,
+  "S36 Squibnocket", "S36", NA, NA, 34, 18
+)
+
+bbc_data <- bbc_data %>%
+  left_join(salinity_ranges, by = c("Stn_ID" = "StnID")) %>%
+  mutate(Sal_QC = ifelse(Sal_ppt < Min_QC_Sal | Sal_ppt > Max_QC_Sal, TRUE, FALSE))
+
+head(bbc_data)
+```
+
+```{r}
+write_csv(bbc_data, "auto_qc_bbc_file.csv")
+```
+
+## Plots
+
+```{r}
+ggplot(bbc_data, aes(x = SAMP_DATE_TIME, y = DO_mgl)) +
+  geom_line() +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed") +
+  labs(x = "Date/Time", y = "Dissolved Oxygen (mg/L)", title = "Dissolved Oxygen over Time")
+
+ggplot(bbc_data, aes(x = SAMP_DATE_TIME, y = Sal_ppt)) +
+  geom_line() + # Plot the salinity over time
+  geom_ribbon(aes(ymin = Min_QC_Sal, ymax = Max_QC_Sal, fill = Stn_ID), alpha = 0.2) + # Add shaded area for salinity range
+  labs(x = "Date/Time", y = "Salinity (ppt)", title = "Salinity over Time with Range by Station") +
+  scale_fill_discrete(name = "Station ID") # Add a legend for the station IDs
+
+ggplot(bbc_data, aes(x = SAMP_DATE_TIME, y = Temp_C_DOlogger)) +
+  geom_line() +
+  geom_hline(yintercept = 5, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 35, color = "red", linetype = "dashed") +
+  labs(x = "Date/Time", y = "Temperature (°C)", title = "Temperature over Time")
+```
+
+## Interactive Plots
+
+```{r}
+# Interactive plot for Dissolved Oxygen over Time
+plot_ly(bbc_data, x = ~SAMP_DATE_TIME, y = ~DO_mgl, type = 'scatter', mode = 'lines') %>%
+  add_trace(y = 0.5, name = 'Critical Value', line = list(color = 'red', dash = 'dash')) %>%
+  layout(title = 'Dissolved Oxygen over Time',
+         xaxis = list(title = 'Date/Time'),
+         yaxis = list(title = 'Dissolved Oxygen (mg/L)'))
+
+# Interactive plot for Salinity over Time with Range by Station
+plot_ly(bbc_data, x = ~SAMP_DATE_TIME, y = ~Sal_ppt, type = 'scatter', mode = 'lines', color = ~Stn_ID) %>%
+  add_ribbons(ymin = ~Min_QC_Sal, ymax = ~Max_QC_Sal, line = list(color = 'rgba(0,0,0,0)'), fillcolor = 'rgba(0,0,0,0.2)') %>%
+  layout(title = 'Salinity over Time with Range by Station',
+         xaxis = list(title = 'Date/Time'),
+         yaxis = list(title = 'Salinity (ppt)'))
+
+# Interactive plot for Temperature over Time
+plot_ly(bbc_data, x = ~SAMP_DATE_TIME, y = ~Temp_C_DOlogger, type = 'scatter', mode = 'lines') %>%
+  add_trace(y = 5, name = 'Critical Value (Low)', line = list(color = 'red', dash = 'dash')) %>%
+  add_trace(y = 35, name = 'Critical Value (High)', line = list(color = 'red', dash = 'dash')) %>%
+  layout(title = 'Temperature over Time',
+         xaxis = list(title = 'Date/Time'),
+         yaxis = list(title = 'Temperature (°C)'))
+```
+
